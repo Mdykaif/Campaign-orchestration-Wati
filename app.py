@@ -1,4 +1,4 @@
-
+import hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import os
@@ -29,6 +29,51 @@ st.set_page_config(
     page_title="WATI Enterprise Broadcast Manager",
     layout="wide"
 )
+
+# ============================================================
+# LOGIN & AUTHENTICATION
+# ============================================================
+
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+
+if not APP_PASSWORD:
+    st.error("Application password is not configured.")
+    st.stop()
+
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+
+    st.title("WATI Campaign Manager")
+    st.caption("Secure application access")
+
+    with st.form("login_form"):
+        st.subheader("Welcome Back")
+
+        entered_password = st.text_input(
+            "Enter Application Password",
+            type="password",
+            placeholder="Enter your password"
+        )
+
+        login_clicked = st.form_submit_button(
+            "Login",
+            type="primary",
+            use_container_width=True
+        )
+
+        if login_clicked:
+            if hmac.compare_digest(
+                entered_password,
+                str(APP_PASSWORD)
+            ):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect password. Please try again.")
+
+    st.stop()
 
 st.title("WATI Enterprise Campaign & Broadcast Manager")
 st.caption(
@@ -543,6 +588,9 @@ app_window = st.sidebar.radio(
         "Scheduled Broadcast Registry"
     ]
 )
+if st.sidebar.button("Logout", use_container_width=True):
+    st.session_state.authenticated = False
+    st.rerun()
 
 
 # ============================================================
@@ -1264,3 +1312,381 @@ if app_window == "Campaign Builder & Dispatch":
                     total_submitted
                 )
 
+
+# ============================================================
+# WORKSPACE 2: SCHEDULED BROADCAST REGISTRY
+# ============================================================
+
+elif app_window == "Scheduled Broadcast Registry":
+
+    st.subheader("Scheduled Broadcast Administration Console")
+    st.caption("Paginated registry sync, broadcast inspection and cancellation.")
+
+    PAGE_SIZE = 100
+    MAX_PAGES = 500
+    MAX_WORKERS = 5
+    GET_RETRIES = 3
+
+    def api_response_json(response):
+        """Return JSON where possible, otherwise a bounded raw response."""
+        try:
+            return response.json()
+        except ValueError:
+            return {"raw_response": (response.text or "")[:3000]}
+
+    def safe_get(url, params=None, timeout=(5, 35)):
+        """Retry safe GETs only; never automatically retry writes."""
+        last_response = None
+        for attempt in range(GET_RETRIES):
+            try:
+                response = requests.get(
+                    url, headers=api_headers, params=params, timeout=timeout
+                )
+            except requests.RequestException:
+                if attempt == GET_RETRIES - 1:
+                    raise
+                time.sleep(min(2 ** attempt, 5))
+                continue
+
+            last_response = response
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                if attempt == GET_RETRIES - 1:
+                    return response
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    delay = min(max(float(retry_after), 0), 15) if retry_after else min(2 ** attempt, 5)
+                except (TypeError, ValueError):
+                    delay = min(2 ** attempt, 5)
+                time.sleep(delay)
+                continue
+            return response
+        return last_response
+
+    def find_broadcast_records(obj, depth=0):
+        """Find a likely list of broadcast records in WATI response wrappers."""
+        if depth > 5:
+            return [], {}
+        if isinstance(obj, list):
+            if not obj or isinstance(obj[0], dict):
+                return obj, {}
+            return [], {}
+        if not isinstance(obj, dict):
+            return [], {}
+
+        metadata = dict(obj)
+        candidate_keys = (
+            "content", "items", "campaigns", "broadcasts", "results", "data"
+        )
+        for key in candidate_keys:
+            value = obj.get(key)
+            if isinstance(value, list):
+                return value, metadata
+            if isinstance(value, dict):
+                records, nested_meta = find_broadcast_records(value, depth + 1)
+                if records or any(k in value for k in candidate_keys):
+                    merged = dict(metadata)
+                    merged.update(nested_meta)
+                    return records, merged
+        return [], metadata
+
+    def read_total_pages(meta, page_size):
+        for key in ("total_pages", "totalPages", "page_count", "pageCount"):
+            value = meta.get(key)
+            try:
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except (TypeError, ValueError):
+                pass
+        for key in ("total_count", "totalCount", "total_records", "totalRecords", "totalElements"):
+            value = meta.get(key)
+            try:
+                if value is not None:
+                    count = int(value)
+                    return max(1, (count + page_size - 1) // page_size)
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def fetch_registry_page(page_number, date_from_utc, date_to_utc):
+        url = f"{WATI_API_URL}/api/ext/v3/broadcasts"
+        params = {
+            "date_from": date_from_utc,
+            "date_to": date_to_utc,
+            "page_number": page_number,
+            "page_size": PAGE_SIZE,
+        }
+        response = safe_get(url, params=params)
+        if response is None or response.status_code != 200:
+            code = response.status_code if response is not None else 0
+            body = response.text[:1000] if response is not None else "No response"
+            raise RuntimeError(f"Page {page_number}: HTTP {code} — {body}")
+        data = api_response_json(response)
+        if isinstance(data, dict) and "raw_response" in data:
+            raise RuntimeError(f"Page {page_number}: WATI returned invalid JSON.")
+        records, metadata = find_broadcast_records(data)
+        return page_number, records, metadata
+
+    def fetch_all_broadcasts(date_from_utc, date_to_utc):
+        """Fetch page 1 first, then parallelize remaining pages when count is known."""
+        _, first_page, metadata = fetch_registry_page(1, date_from_utc, date_to_utc)
+        all_records = list(first_page)
+        total_pages = read_total_pages(metadata, PAGE_SIZE)
+
+        if total_pages is not None:
+            total_pages = min(total_pages, MAX_PAGES)
+            if total_pages > 1:
+                page_numbers = range(2, total_pages + 1)
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = {
+                        executor.submit(
+                            fetch_registry_page, page, date_from_utc, date_to_utc
+                        ): page for page in page_numbers
+                    }
+                    page_results = {}
+                    for future in as_completed(futures):
+                        page_no, records, _ = future.result()
+                        page_results[page_no] = records
+                for page_no in sorted(page_results):
+                    all_records.extend(page_results[page_no])
+        else:
+            # If WATI omits page metadata, fetch sequentially until a short page.
+            # This avoids assuming a page count and avoids unnecessary concurrent calls.
+            page_no = 2
+            while page_no <= MAX_PAGES and len(first_page) == PAGE_SIZE:
+                _, records, _ = fetch_registry_page(page_no, date_from_utc, date_to_utc)
+                if not records:
+                    break
+                all_records.extend(records)
+                if len(records) < PAGE_SIZE:
+                    break
+                page_no += 1
+
+        # De-duplicate by broadcast ID while preserving API order.
+        unique = []
+        seen_ids = set()
+        for record in all_records:
+            if not isinstance(record, dict):
+                continue
+            bid = record.get("id", record.get("broadcastId", record.get("broadcast_id")))
+            if bid is not None:
+                key = str(bid)
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+            unique.append(record)
+        return unique
+
+    def broadcast_id(record):
+        return str(record.get("id", record.get("broadcastId", record.get("broadcast_id", ""))))
+
+    def broadcast_name(record):
+        return str(record.get("name", record.get("broadcastName", record.get("broadcast_name", "Unnamed broadcast"))))
+
+    def format_broadcast_rows(records):
+        rows = []
+        for item in records:
+            rows.append({
+                "Broadcast ID": broadcast_id(item),
+                "Broadcast Name": broadcast_name(item),
+                "Lifecycle Status": item.get("status", item.get("state", "Unknown")),
+                "Created Timestamp": item.get("createdTime", item.get("createdAt", item.get("created_at", ""))),
+                "Scheduled At": item.get("scheduledAt", item.get("scheduled_at", item.get("scheduledTime", ""))),
+                "Template": item.get("templateName", item.get("template_name", "")),
+                "Recipients": item.get("totalRecipients", item.get("recipientCount", item.get("recipientsCount", ""))),
+            })
+        return pd.DataFrame(rows)
+
+    # WATI date filters are date-time values. Convert IST day boundaries to UTC.
+    col1, col2 = st.columns(2)
+    with col1:
+        from_date = st.date_input(
+            "Date From",
+            value=datetime.date.today() - datetime.timedelta(days=30),
+            key="broadcast_from_date"
+        )
+    with col2:
+        to_date = st.date_input(
+            "Date To",
+            value=datetime.date.today() + datetime.timedelta(days=30),
+            key="broadcast_to_date"
+        )
+
+    if from_date > to_date:
+        st.error("Date From cannot be later than Date To.")
+        st.stop()
+
+    date_from_utc = ist_to_utc(from_date, datetime.time.min).strftime("%Y-%m-%dT%H:%M:%SZ")
+    date_to_utc = ist_to_utc(to_date, datetime.time.max).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cache_signature = (date_from_utc, date_to_utc)
+
+    sync_col, clear_col = st.columns([1, 1])
+    with sync_col:
+        sync_clicked = st.button("Synchronize Gateway Records", type="primary")
+    with clear_col:
+        clear_clicked = st.button("Clear Cached Registry")
+
+    if clear_clicked:
+        st.session_state.registry_cache = None
+        st.session_state.registry_cache_signature = None
+        st.session_state.registry_error = None
+        st.rerun()
+
+    needs_sync = (
+        sync_clicked
+        or st.session_state.registry_cache is None
+        or st.session_state.registry_cache_signature != cache_signature
+    )
+
+    if needs_sync:
+        try:
+            with st.spinner("Fetching WATI broadcast pages..."):
+                records = fetch_all_broadcasts(date_from_utc, date_to_utc)
+            st.session_state.registry_cache = records
+            st.session_state.registry_cache_signature = cache_signature
+            st.session_state.registry_last_sync = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state.registry_error = None
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            st.session_state.registry_error = str(exc)
+
+    if st.session_state.registry_error:
+        st.error(f"Registry sync failed: {st.session_state.registry_error}")
+        if st.session_state.registry_cache:
+            st.warning("Showing the last successfully cached results; these may be stale.")
+
+    campaigns_list = st.session_state.registry_cache or []
+    if st.session_state.registry_cache_signature == cache_signature:
+        st.caption(f"Last successful sync: {st.session_state.registry_last_sync or 'Not available'}")
+
+    if campaigns_list:
+        st.success(f"Loaded {len(campaigns_list)} unique broadcast records.")
+        st.dataframe(format_broadcast_rows(campaigns_list), use_container_width=True, hide_index=True)
+
+        selectable = [c for c in campaigns_list if broadcast_id(c)]
+        labels = {
+            f"{broadcast_name(c)} | {broadcast_id(c)} | {c.get('status', 'Unknown')}": broadcast_id(c)
+            for c in selectable
+        }
+        if labels:
+            selected_label = st.selectbox("Select a broadcast to inspect or manage", list(labels.keys()))
+            selected_id = labels[selected_label]
+
+            detail_tab, cancel_tab, reschedule_tab = st.tabs([
+                "Broadcast Details", "Cancel Broadcast", "Experimental Reschedule"
+            ])
+
+            with detail_tab:
+                if st.button("Fetch Full Broadcast Details", key="fetch_broadcast_detail"):
+                    detail_url = f"{WATI_API_URL}/api/ext/v3/broadcasts/{selected_id}"
+                    try:
+                        with st.spinner("Fetching broadcast details..."):
+                            detail_response = safe_get(detail_url)
+                        if detail_response.status_code == 200:
+                            detail_data = api_response_json(detail_response)
+                            st.json(detail_data)
+                            st.session_state[f"broadcast_detail_{selected_id}"] = detail_data
+                        else:
+                            st.error(f"Detail request failed: HTTP {detail_response.status_code}")
+                            st.text(detail_response.text[:2000])
+                    except requests.RequestException as exc:
+                        st.error(f"Detail request failed: {exc}")
+
+                cached_detail = st.session_state.get(f"broadcast_detail_{selected_id}")
+                if cached_detail is not None:
+                    with st.expander("Previously fetched detail response", expanded=False):
+                        st.json(cached_detail)
+
+                with st.expander("List record snapshot"):
+                    selected_record = next((x for x in selectable if broadcast_id(x) == selected_id), None)
+                    st.json(selected_record or {})
+
+            with cancel_tab:
+                st.warning("Cancellation is a write operation. Confirm the exact broadcast ID before proceeding.")
+                st.code(selected_id)
+                confirm_cancel = st.checkbox(
+                    f"I confirm cancellation of broadcast {selected_id}",
+                    key=f"confirm_cancel_{selected_id}"
+                )
+                if st.button("Cancel Scheduled Broadcast", type="primary", disabled=not confirm_cancel, key=f"cancel_{selected_id}"):
+                    # Legacy WATI V1 cancellation endpoint from the existing integration.
+                    cancel_url = (
+                        f"{WATI_API_URL}/{TENANT_ID}/api/v1/broadcast/"
+                        f"deleteScheduledBroadcast/{selected_id}"
+                    )
+                    try:
+                        # No automatic retry for DELETE: an unknown outcome must be checked first.
+                        cancel_response = requests.delete(
+                            cancel_url, headers=api_headers, timeout=(5, 30)
+                        )
+                        if cancel_response.status_code in (200, 202, 204):
+                            st.success(f"Cancellation request accepted for broadcast {selected_id}.")
+                            st.session_state.registry_cache = [
+                                row for row in campaigns_list if broadcast_id(row) != selected_id
+                            ]
+                            st.session_state.registry_last_sync = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            st.error(f"Cancellation failed: HTTP {cancel_response.status_code}")
+                            st.text(cancel_response.text[:2000])
+                    except requests.RequestException as exc:
+                        st.error(
+                            "Cancellation outcome is unknown because the connection failed. "
+                            "Refresh the registry and verify the broadcast status before retrying."
+                        )
+                        st.caption(str(exc))
+
+            with reschedule_tab:
+                st.warning(
+                    "Experimental only: the updateScheduledBroadcast endpoint in the original "
+                    "integration is not confirmed in the current WATI API documentation. "
+                    "Use only if WATI has explicitly enabled this endpoint for your tenant."
+                )
+                enable_experimental = st.checkbox(
+                    "I understand this endpoint is unverified and want to enable it",
+                    key=f"enable_reschedule_{selected_id}"
+                )
+                new_date = st.date_input(
+                    "New Date (IST)", value=datetime.date.today() + datetime.timedelta(days=1),
+                    key=f"reschedule_date_{selected_id}"
+                )
+                new_time = st.time_input(
+                    "New Time (IST)", value=datetime.time(12, 0),
+                    key=f"reschedule_time_{selected_id}"
+                )
+                if st.button(
+                    "Attempt Experimental Reschedule", type="primary",
+                    disabled=not enable_experimental,
+                    key=f"experimental_reschedule_{selected_id}"
+                ):
+                    new_dt_utc = ist_to_utc(new_date, new_time)
+                    if new_dt_utc <= datetime.datetime.now(datetime.timezone.utc):
+                        st.error("Please select a future date and time.")
+                    else:
+                        new_iso = new_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        experimental_url = (
+                            f"{WATI_API_URL}/{TENANT_ID}/api/v1/broadcast/"
+                            "updateScheduledBroadcast"
+                        )
+                        try:
+                            # No automatic retry for PUT: avoid duplicate/uncertain writes.
+                            edit_response = requests.put(
+                                experimental_url,
+                                headers=api_headers,
+                                json={"broadcastId": selected_id, "scheduledTime": new_iso},
+                                timeout=(5, 30)
+                            )
+                            if edit_response.status_code in (200, 202, 204):
+                                st.success(f"Experimental reschedule accepted: {new_iso} UTC")
+                                st.json(api_response_json(edit_response))
+                                st.session_state.registry_cache = None
+                            else:
+                                st.error(f"Experimental reschedule failed: HTTP {edit_response.status_code}")
+                                st.text(edit_response.text[:2000])
+                        except requests.RequestException as exc:
+                            st.error(
+                                "Reschedule outcome is unknown due to a connection failure. "
+                                "Verify the broadcast in WATI before trying again."
+                            )
+                            st.caption(str(exc))
+        else:
+            st.info("No broadcast IDs were present in the returned records.")
+    else:
+        st.info("No scheduled broadcast records found for this date range.")
